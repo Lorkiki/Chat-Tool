@@ -1,182 +1,155 @@
-package SendFile;
-
-
-import javax.swing.*;
-import java.awt.*;
-import java.io.*;
-import java.net.InetAddress;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.UnknownHostException;
-import java.util.concurrent.ConcurrentHashMap;
-
-class ChatServerGUI extends JFrame {
-    private JTextArea textArea;
-
-    public ChatServerGUI() {
-        textArea = new JTextArea(20, 50);
-        textArea.setEditable(false);
-        add(new JScrollPane(textArea), BorderLayout.CENTER);
-        setTitle("Chat Server");
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        pack();
-        setVisible(true);
-    }
-
-    public void displayMessage(String message) {
-        SwingUtilities.invokeLater(() -> textArea.append(message + "\n"));
-    }
-}
+import java.util.HashSet;
+import java.util.Set;
 
 public class ChatServer {
-    public static final ConcurrentHashMap<String, ClientHandler> userSessions = new ConcurrentHashMap<>();
-    private static ChatServerGUI serverGUI;
-
-    public static void main(String[] args) throws UnknownHostException {
-        serverGUI = new ChatServerGUI();
-        String ip = InetAddress.getLocalHost().getHostAddress();
-        int port = 6799;
-        serverGUI.displayMessage("Chat Server is listening\n" +
-                                "IP address: " + ip + "\n" +
-                                "Port: " + port);
-
-
+    private static Set<ClientHandler> clientHandlers = new HashSet<>();
+    
+    public static void main(String[] args) {
+        int port = 12345;
         try (ServerSocket serverSocket = new ServerSocket(port)) {
+            System.out.println("Server started on port: " + port);
+
             while (true) {
                 Socket socket = serverSocket.accept();
-                serverGUI.displayMessage("Client connected from: " + socket.getInetAddress());
-                new ClientHandler(socket, serverGUI).start();
+                System.out.println("New client connected: " + socket.getInetAddress());
+
+                ClientHandler clientHandler = new ClientHandler(socket, clientHandlers);
+                clientHandlers.add(clientHandler);
+                new Thread(clientHandler).start();
             }
-        } catch (IOException ex) {
-            serverGUI.displayMessage("Server exception: " + ex.getMessage());
-            ex.printStackTrace();
+        } catch (IOException e) {
+            System.out.println("Error starting server: " + e.getMessage());
         }
     }
-
-    public static void broadcastMessage(String message, ClientHandler sender) {
-        userSessions.forEach((username, handler) -> {
-            if (handler != sender) {
-                handler.sendMessage(message);
-            }
-        });
-    }
-
-
-    public static void broadcastFile( ClientHandler sender, int dataType, String fileName, byte[] fileData ) {
-        userSessions.forEach((username, handler) -> {
-            if (handler != sender) {
-                try {
-                    handler.sendFile(  dataType,  fileName, fileData );
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-
-            }
-        });
-    }
-
-    // Call this method when a client disconnects to notify the server GUI
-    public static void notifyDisconnection(String username) {
-        serverGUI.displayMessage(username + " has disconnected.");
-    }
-
-
 }
 
-class ClientHandler extends Thread implements Runnable {
+class ClientHandler implements Runnable {
     private Socket socket;
+    private PrintWriter out;
+    private BufferedReader in;
+    private Set<ClientHandler> clientHandlers;
     private String username;
-    private DataOutputStream outToClient;
-    private ChatServerGUI serverGUI;
 
-    public ClientHandler(Socket socket, ChatServerGUI serverGUI) {
+    public ClientHandler(Socket socket, Set<ClientHandler> clientHandlers) {
         this.socket = socket;
-        this.serverGUI = serverGUI;
+        this.clientHandlers = clientHandlers;
     }
 
+    @Override
     public void run() {
-        try (DataInputStream dis = new DataInputStream(new BufferedInputStream(socket.getInputStream())))
-           {
+        try {
+            in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            out = new PrintWriter(socket.getOutputStream(), true);
+            
+            // Ask for username
+            out.println("Enter your username: ");
+            username = in.readLine();
+            System.out.println(username + " has joined the chat.");
 
-            outToClient = new DataOutputStream(socket.getOutputStream());
+            // Notify others of the new connection
+            broadcastMessage("Server: " + username + " has joined the chat.", this);
 
-            outToClient.writeInt(1);
-            outToClient.writeUTF("Enter username:\n");
-            dis.readInt();
-            this.username = dis.readUTF().trim();
-               if (!ChatServer.userSessions.containsKey(this.username)) {
-                   ChatServer.userSessions.put(this.username, this);
-                   serverGUI.displayMessage(username + " has joined the chat.");
-               } else {
-                   // Handle duplicate username case
-                   outToClient.writeUTF("Username already taken. Please reconnect with a different username.\n");
-                   return; // Exit the thread
-               }
+            // Send the list of currently connected users
+            sendUserList();
 
-
-               while (true) {
-                    int dataType = dis.readInt();
-                    if (dataType == 1) {
-                        // Text message
-                        String message = dis.readUTF();
-                        String messageToSend = this.username + ": " + message;
-                        System.out.println(messageToSend);
-                        ChatServer.broadcastMessage(messageToSend, this);
-                    }
-                    else if (dataType == 2) {
-                        // File
-                        String fileName = dis.readUTF();
-                        long fileSize = dis.readLong();
-                        byte[] buffer = new byte[4096];
-                        int bytesRead;
-                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                        while (fileSize > 0 && (bytesRead = dis.read(buffer, 0, (int)Math.min(buffer.length, fileSize))) != -1) {
-                            baos.write(buffer, 0, bytesRead);
-                            fileSize -= bytesRead;
-                        }
-                        ChatServer.broadcastFile( this,2,fileName, baos.toByteArray());
-
-                    }
-
+            // Handle incoming messages
+            String message;
+            while ((message = in.readLine()) != null) {
+                if (message.startsWith("@")) {
+                    sendPrivateMessage(message);
+                } else if (message.startsWith("#")){
+                    sendKey(message);
                 }
-
-
-        } catch (IOException ex) {
-            serverGUI.displayMessage(username + " has disconnected due to an error.");
+                else {
+                    broadcastMessage(username + ": " + message, this);
+                }
+            }
+        } catch (IOException e) {
+            System.out.println(username + " disconnected.");
         } finally {
-            // Notify the server GUI of the disconnection in the finally block
-            ChatServer.notifyDisconnection(username);
-            ChatServer.userSessions.remove(username);
-            try {
-                socket.close();
-            } catch (IOException e) {
-                serverGUI.displayMessage("Error closing the socket for user " + username);
-                e.printStackTrace();
+            cleanup();
+        }
+    }
+
+    private void broadcastMessage(String message, ClientHandler excludeUser) {
+        for (ClientHandler client : clientHandlers) {
+            if (client != excludeUser) {
+                client.out.println(message);
             }
         }
     }
 
+    private void sendPrivateMessage(String message) {
+        String[] messageParts = message.split(":", 2);
+        if (messageParts.length < 2) {
+            out.println("Invalid private message format. Use @username message.");
+            return;
+        }
+
+        String targetUsername = messageParts[0].substring(1); // Remove '@' from username
+        String privateMessage = messageParts[1];
 
 
-    public void sendMessage(String message) {
+        boolean foundUser = false;
+        for (ClientHandler client : clientHandlers) {
+            if (client.username.equalsIgnoreCase(targetUsername)) {
+                client.out.println("@Private from " + username + ": " + privateMessage);
+                out.println("Private to " + targetUsername + ": " + privateMessage);
+                foundUser = true;
+                break;
+            }
+        }
+        if (!foundUser) {
+            out.println("User " + targetUsername + " not found.");
+        }
+    }
+
+
+    private void sendKey(String message) {
+        String[] messageParts = message.split(" ", 2);
+        if (messageParts.length < 2) {
+            out.println("Invalid key format. ");
+            return;
+        }
+
+        String publickey = messageParts[1];
+
+
+        for (ClientHandler client : clientHandlers) {
+
+                client.out.println("#: " + username + ": "+  publickey);
+
+        }
+
+    }
+
+
+
+
+
+
+
+    private void sendUserList() {
+        out.println("Connected users:");
+        for (ClientHandler client : clientHandlers) {
+            out.println("- " + client.username);
+        }
+    }
+
+    private void cleanup() {
         try {
-            outToClient.writeInt(1);
-            outToClient.writeUTF(message + "\n");
+            clientHandlers.remove(this);
+            socket.close();
+            System.out.println(username + " has left the chat.");
+            broadcastMessage("Server: " + username + " has left the chat.", this);
         } catch (IOException e) {
-            serverGUI.displayMessage("Failed to send message to " + username);
-            e.printStackTrace();
+            System.out.println("Error closing socket: " + e.getMessage());
         }
     }
-
-
-
-    public void sendFile( int dataType, String fileName, byte[] fileData ) throws IOException {
-        outToClient.writeInt(dataType);
-        outToClient.writeUTF(fileName);
-        outToClient.writeLong(fileData.length);
-        outToClient.write(fileData);
-
-        }
-
-    }
-
+}
